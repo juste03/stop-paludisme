@@ -1,0 +1,8 @@
+{
+  "name": "STOP PALUDISME",
+  "description": "Application de gestion des ventes de moustiquaires électriques, recouvrement et prospection à Bukavu.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

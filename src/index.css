@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+@media print {
+  body * {
+    visibility: hidden !important;
+  }
+  #printable-protocol-fiche, #printable-protocol-fiche *,
+  #printable-receipt-area, #printable-receipt-area *,
+  #printable-paycheck-area, #printable-paycheck-area * {
+    visibility: visible !important;
+  }
+  #printable-protocol-fiche,
+  #printable-receipt-area,
+  #printable-paycheck-area {
+    position: absolute !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 10mm !important;
+    background: white !important;
+    color: black !important;
+    box-shadow: none !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+}
