@@ -22,8 +22,17 @@ jobs:
         with:
           node-version: '18' 
 
-      - name: Install dependencies
-        run: npm install
+      
+
+- name: Install dependencies (Clean)
+  run: |
+    rm -rf node_modules package-lock.json
+    npm install
+
+
+
+
+
 
       - name: Build frontend (Vite)
         run: npm run build 
