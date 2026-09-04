@@ -22,17 +22,11 @@ jobs:
         with:
           node-version: '18' 
 
-      
-
-- name: Install dependencies (Clean)
-  run: |
-    rm -rf node_modules package-lock.json
-    npm install
-
-
-
-
-
+      # --- CORRECTION : Ce bloc est maintenant correctement aligné avec les autres étapes ---
+      - name: Install dependencies (Clean)
+        run: |
+          rm -rf node_modules package-lock.json
+          npm install
 
       - name: Build frontend (Vite)
         run: npm run build 
@@ -64,4 +58,5 @@ jobs:
         with:
           name: android-apk-debug
           # Vérifiez bien que le chemin de l'APK est correct pour votre projet
+          # C'est le chemin standard pour un build debug avec Capacitor/Android
           path: android/app/build/outputs/apk/debug/app-debug.apk
