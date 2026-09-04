@@ -22,11 +22,11 @@ jobs:
         with:
           node-version: '18' 
 
-      # --- CORRECTION : Ce bloc est maintenant correctement aligné avec les autres étapes ---
-      - name: Install dependencies (Clean)
+      # --- CORRECTION : Utilisation de npm ci pour une installation propre et fiable ---
+      - name: Install dependencies (Clean CI)
         run: |
-          rm -rf node_modules package-lock.json
-          npm install
+          rm -rf node_modules
+          npm ci
 
       - name: Build frontend (Vite)
         run: npm run build 
