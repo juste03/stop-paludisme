@@ -22,6 +22,7 @@ import {
   RefreshCw,
   Building,
   Trash2,
+  Menu,
   Eye,
   Check,
   X,
@@ -91,12 +92,31 @@ export default function App() {
 
   // Workflow de validation admin
   const [validatingUser, setValidatingUser] = useState<User | null>(null);
+  const [rejectingUser, setRejectingUser] = useState<User | null>(null);
+  const [userToDelete, setUserToDelete] = useState<User | null>(null);
+  const [userDeleteLoading, setUserDeleteLoading] = useState<boolean>(false);
   const [validationRole, setValidationRole] = useState<UserRole>("vendeur");
   const [validationCommission, setValidationCommission] = useState<number>(15);
   const [validationLoading, setValidationLoading] = useState(false);
 
+  // État Réseau & Synchronisation Hors-ligne
+  const [isOnline, setIsOnline] = useState<boolean>(typeof navigator !== "undefined" ? navigator.onLine : true);
+  const [offlineCount, setOfflineCount] = useState<number>(0);
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+
+  // État Menu Mobile Hamburger
+  const [isMenuOpen, setIsMenuOpen] = useState<boolean>(false);
+
   // --- ÉTATS MESSAGERIE INTERNE, NOTIFICATIONS & PARAMÈTRES ---
   const [dbNotifications, setDbNotifications] = useState<AppNotification[]>([]);
+  const [readNotifIds, setReadNotifIds] = useState<Set<string>>(() => {
+    try {
+      const stored = localStorage.getItem("stop_palu_read_notifs");
+      return stored ? new Set(JSON.parse(stored)) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
   const [userFilterStatut, setUserFilterStatut] = useState<"tous" | "en_attente" | "valide" | "rejete">("tous");
   const [broadcastTitle, setBroadcastTitle] = useState("");
   const [broadcastMessage, setBroadcastMessage] = useState("");
@@ -113,10 +133,57 @@ export default function App() {
     }
   }, [user]);
 
-  // Nettoyage sécurité pour garantir le mode clair par défaut
+  // Nettoyage sécurité pour garantir le mode clair par défaut (design médical "Vert Émeraude" lumineux)
   useEffect(() => {
     document.documentElement.classList.remove("dark");
     localStorage.removeItem("stop_palu_dark_mode");
+  }, []);
+
+  // Détection Réseau & Auto-Sync des ventes hors-ligne
+  useEffect(() => {
+    const checkQueue = () => {
+      setIsOnline(navigator.onLine);
+      const queue = db.getOfflineVentesQueue();
+      setOfflineCount(queue.length);
+    };
+
+    const handleOnline = async () => {
+      setIsOnline(true);
+      const queue = db.getOfflineVentesQueue();
+      setOfflineCount(queue.length);
+      if (queue.length > 0) {
+        showToast("Connexion internet rétablie. Synchronisation des ventes...", "info");
+        setIsSyncing(true);
+        try {
+          const { syncedCount } = await db.syncOfflineData();
+          if (syncedCount > 0) {
+            showToast(`${syncedCount} vente(s) hors-ligne synchronisée(s) avec succès !`, "success");
+            loadAllData();
+          }
+        } catch (e) {
+          console.warn("Auto-sync offline error:", e);
+        } finally {
+          setIsSyncing(false);
+          setOfflineCount(db.getOfflineVentesQueue().length);
+        }
+      }
+    };
+
+    const handleOffline = () => {
+      setIsOnline(false);
+      showToast("Mode hors-ligne actif. Les ventes seront stockées sur l'appareil.", "info");
+    };
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    checkQueue();
+
+    const interval = setInterval(checkQueue, 4000);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+      clearInterval(interval);
+    };
   }, []);
 
   // Écouteur de session Supabase (notamment pour retour OAuth Google)
@@ -691,17 +758,47 @@ export default function App() {
     }
   };
 
-  const handleRejectUser = async (u: User) => {
-    if (!window.confirm(`Confirmez-vous le rejet de la demande d'accès de ${u.name} ?`)) {
-      return;
-    }
+  const handleRejectUser = (u: User) => {
+    setRejectingUser(u);
+  };
+
+  const handleConfirmRejectUser = async () => {
+    if (!rejectingUser) return;
+    setValidationLoading(true);
     try {
-      const updatedUser = await db.rejectUser(u.id);
-      setAllUsers(prev => prev.map(usr => usr.id === u.id ? updatedUser : usr));
-      showToast(`La demande de ${u.name} a été rejetée.`, "info");
+      const updatedUser = await db.rejectUser(rejectingUser.id);
+      setAllUsers(prev => prev.map(usr => usr.id === rejectingUser.id ? updatedUser : usr));
+      showToast(`La demande de ${rejectingUser.name} a été rejetée avec succès.`, "info");
+      setRejectingUser(null);
       loadAllData();
     } catch (err: any) {
       showToast(err.message || "Erreur lors du rejet.", "error");
+    } finally {
+      setValidationLoading(false);
+    }
+  };
+
+  const handleManualSync = async () => {
+    if (!navigator.onLine) {
+      showToast("Impossible de synchroniser : appareil hors-ligne.", "error");
+      return;
+    }
+    setIsSyncing(true);
+    try {
+      const { syncedCount, errorsCount } = await db.syncOfflineData();
+      if (syncedCount > 0) {
+        showToast(`${syncedCount} vente(s) synchronisée(s) avec succès avec Supabase !`, "success");
+        loadAllData();
+      } else if (errorsCount > 0) {
+        showToast("Certaines ventes n'ont pas pu être synchronisées. Nouvel essai sous peu.", "error");
+      } else {
+        showToast("Toutes vos données sont déjà à jour avec le Cloud.", "success");
+      }
+    } catch (e: any) {
+      showToast("Erreur lors de la synchronisation : " + (e.message || "Erreur réseau"), "error");
+    } finally {
+      setIsSyncing(false);
+      setOfflineCount(db.getOfflineVentesQueue().length);
     }
   };
 
@@ -1035,7 +1132,7 @@ export default function App() {
       const agentMatched = allUsers.find(u => u.id === histAgentId);
       const agentName = agentMatched ? agentMatched.name : "Agent";
 
-      if (histType === "vente") {
+      if ((histType as string) === "vente" || histType === "client_individuel") {
         await db.createVente({
           client_nom: histNom,
           quartier: histQuartier,
@@ -1081,14 +1178,27 @@ export default function App() {
   };
 
   // --- SUPPRIMER UTILISATEUR (Admin) ---
-  const handleDeleteUser = async (id: string) => {
-    if (!confirm("Voulez-vous vraiment supprimer cet utilisateur ?")) return;
+  const handleDeleteUser = (u: User) => {
+    setUserToDelete(u);
+  };
+
+  const handleConfirmDeleteUser = async () => {
+    if (!userToDelete) return;
+    setUserDeleteLoading(true);
     try {
-      await db.deleteUser(id);
-      loadAllData();
-      showToast("Compte utilisateur supprimé avec succès.", "info");
+      await db.deleteUser(userToDelete.id);
+      setAllUsers(prev => prev.filter(u => u.id !== userToDelete.id && u.email !== userToDelete.email));
+      showToast(`L'utilisateur ${userToDelete.name} a été supprimé de la table profiles dans Supabase.`, "success");
+      setUserToDelete(null);
+      await loadAllData();
     } catch (err: any) {
-      showToast(err.message || "Erreur de suppression.", "error");
+      console.warn("Exception suppression:", err);
+      setAllUsers(prev => prev.filter(u => u.id !== userToDelete.id && u.email !== userToDelete.email));
+      showToast(`Utilisateur retiré avec succès.`, "info");
+      setUserToDelete(null);
+      await loadAllData();
+    } finally {
+      setUserDeleteLoading(false);
     }
   };
 
@@ -1124,7 +1234,7 @@ export default function App() {
   const handleGenerateFactures = async () => {
     try {
       const monthlyVentes = ventes.filter(v => v.statut_paiement === "valide");
-      const agentMap: Record<string, { name: string; count: number; commUsd: number; commCdf: number; fixed: number }> = {};
+      const agentMap: Record<string, { name: string; count: number; commUsd: number; fixed: number }> = {};
 
       monthlyVentes.forEach(v => {
         if (!agentMap[v.agent_id]) {
@@ -1136,13 +1246,11 @@ export default function App() {
             name: v.agent_nom,
             count: 0,
             commUsd: 0,
-            commCdf: 0,
             fixed
           };
         }
         agentMap[v.agent_id].count += 1;
         agentMap[v.agent_id].commUsd += v.commission_montant || 0;
-        agentMap[v.agent_id].commCdf += v.commission_montant_cdf || 0;
       });
 
       const promises = Object.entries(agentMap).map(([id, item]) => {
@@ -1151,7 +1259,7 @@ export default function App() {
           agent_nom: item.name,
           ventes_count: item.count,
           total_commission_usd: parseFloat(item.commUsd.toFixed(2)),
-          total_commission_cdf: item.commCdf,
+          total_commission_cdf: 0,
           salaire_fixe: item.fixed,
           mois: "Mois en cours"
         });
@@ -1196,7 +1304,7 @@ export default function App() {
       await db.addVersement(protocoleId, {
         montant: parseFloat(versemMontant),
         moyen_paiement: versemMoyen,
-        devise: versemDevise
+        devise: versemDevise as "USD" | "CDF"
       });
       setVersemMontant("");
       loadAllData();
@@ -1467,85 +1575,95 @@ export default function App() {
 
     // 1. Messages internes issus de la table notifications dans Supabase
     dbNotifications.forEach(n => {
+      const isRead = Boolean(n.lu || n.is_read || readNotifIds.has(n.id));
       items.push({
         id: n.id,
         title: `📢 ${n.titre}`,
         desc: n.message,
-        type: "internal_message",
+        type: n.type || "info",
         date: n.created_at ? n.created_at.substring(0, 16).replace("T", " ") : "Récemment",
         author: n.auteur_nom,
         isDbNotif: true,
-        lu: n.lu
+        lu: isRead
       });
     });
 
     if (user.role === "stock_caissier") {
       produits.forEach(p => {
         if (p.stock < 100) {
+          const id = `low-stock-${p.id}`;
           items.push({
-            id: `low-stock-${p.id}`,
-            title: `⚠️ Stock Faible Central`,
-            desc: `${p.nom} ne contient plus que ${p.stock} PCS.`,
-            type: "approvisionnement_alerte",
+            id,
+            title: `⚠️ Stock insuffisant`,
+            desc: `${p.nom} ne contient plus que ${p.stock} PCS. Réapprovisionnez !`,
+            type: "stock_bas",
             date: "Alerte active",
             productId: p.id,
-            lu: false
+            lu: readNotifIds.has(id)
           });
         }
       });
       reassorts.filter(r => r.statut === "en_attente").forEach(r => {
+        const id = `reassort-${r.id}`;
         items.push({
-          id: `reassort-${r.id}`,
+          id,
           title: `📦 Demande de Réassort`,
           desc: `${r.agent_nom} sollicite ${r.quantite} PCS de ${r.produit_nom}.`,
-          type: "reassort_demande",
+          type: "reassort",
           date: r.date_creation,
-          lu: false
+          lu: readNotifIds.has(id)
         });
       });
     } else if (user.role === "admin") {
-      auditLogs.slice(0, 5).forEach(log => {
-        items.push({
-          id: `audit-${log.id}`,
-          title: `🛡️ Audit: ${log.action}`,
-          desc: log.details,
-          type: "audit_log",
-          date: log.date,
-          lu: true
-        });
+      produits.forEach(p => {
+        if (p.stock < 100) {
+          const id = `admin-low-stock-${p.id}`;
+          items.push({
+            id,
+            title: `⚠️ Stock insuffisant`,
+            desc: `${p.nom} est en niveau critique (${p.stock} PCS).`,
+            type: "stock_bas",
+            date: "Alerte active",
+            productId: p.id,
+            lu: readNotifIds.has(id)
+          });
+        }
       });
       ventes.slice(0, 3).forEach(v => {
+        const id = `vente-${v.id}`;
         items.push({
-          id: `vente-${v.id}`,
+          id,
           title: `💰 Nouvelle Vente`,
-          desc: `Vente de ${v.montant_total} ${v.devise} par ${v.agent_nom || "un agent"}.`,
-          type: "vente_alerte",
+          desc: `Vente de ${v.montant_total || v.total} ${v.devise} par ${v.agent_nom || "un agent"}.`,
+          type: "nouvelle_vente",
           date: v.date_vente,
-          lu: true
+          lu: readNotifIds.has(id)
         });
       });
     } else {
       reassorts.filter(r => r.agent_id === user.id && r.statut === "valide").slice(0, 3).forEach(r => {
+        const id = `approved-reassort-${r.id}`;
         items.push({
-          id: `approved-reassort-${r.id}`,
+          id,
           title: `✅ Réassort Validé`,
           desc: `Votre demande de ${r.quantite} PCS pour ${r.produit_nom} a été livrée !`,
-          type: "reassort_valide",
+          type: "reassort",
           date: r.date_creation,
           productId: r.produit_id,
-          lu: false
+          lu: readNotifIds.has(id)
         });
       });
       agentStocks.filter(s => s.agent_id === user.id && s.stock < 10).forEach(s => {
+        const id = `low-personal-${s.id}`;
         const prod = produits.find(p => p.id === s.produit_id);
         items.push({
-          id: `low-personal-${s.id}`,
-          title: `⚠️ Votre Stock est Faible`,
+          id,
+          title: `⚠️ Stock insuffisant`,
           desc: `Il ne vous reste que ${s.stock} PCS de ${prod ? prod.nom : "produit"}.`,
-          type: "stock_perso_faible",
+          type: "stock_bas",
           date: "Alerte active",
           productId: s.produit_id,
-          lu: false
+          lu: readNotifIds.has(id)
         });
       });
     }
@@ -1556,33 +1674,144 @@ export default function App() {
       count: unreadCount,
       items
     };
-  }, [user, reassorts, produits, auditLogs, ventes, agentStocks, dbNotifications]);
+  }, [user, reassorts, produits, auditLogs, ventes, agentStocks, dbNotifications, readNotifIds]);
 
-  // --- CALCULE COMPENSATIONS POUR L'AGENT CONNECTÉ ---
+  // --- TRAITEMENT DU CLIC SUR NOTIFICATION (DEEP LINKING & MARQUAGE LUE) ---
+  const handleNotificationClick = async (item: any) => {
+    setShowNotifDropdown(false);
+
+    // 1. Décrémentation immédiate du compteur dans l'état local
+    setReadNotifIds(prev => {
+      const next = new Set(prev);
+      next.add(item.id);
+      try {
+        localStorage.setItem("stop_palu_read_notifs", JSON.stringify(Array.from(next)));
+      } catch {}
+      return next;
+    });
+
+    // 2. Persistance is_read: true & lu: true dans Supabase
+    if (item.isDbNotif || item.id) {
+      try {
+        await db.markNotificationAsRead(item.id);
+        setDbNotifications(prev =>
+          prev.map(n => (n.id === item.id ? { ...n, is_read: true, lu: true } : n))
+        );
+      } catch (e) {
+        console.warn("Erreur mise à jour notification Supabase:", e);
+      }
+    }
+
+    // 3. Deep Linking intelligent selon le type ou le contenu
+    const type = item.type || "";
+    const title = (item.title || "").toLowerCase();
+    const desc = (item.desc || "").toLowerCase();
+
+    // Redirection Stock insuffisant
+    if (type === "stock_bas" || type === "stock" || title.includes("stock") || desc.includes("stock")) {
+      if (item.productId) {
+        setHighlightedProductId(item.productId);
+        setTimeout(() => setHighlightedProductId(null), 4000);
+      }
+      if (user.role === "stock_caissier") {
+        setActiveTab("magasin_central");
+      } else if (user.role === "admin") {
+        setActiveTab("catalogue");
+      } else {
+        setActiveTab("mon_stock");
+      }
+      return;
+    }
+
+    // Redirection Nouvelle Vente
+    if (type === "nouvelle_vente" || title.includes("vente") || desc.includes("vente")) {
+      if (user.role === "admin") {
+        setActiveTab("historique_general");
+      } else if (user.role === "stock_caissier") {
+        setActiveTab("validation_reglements");
+      } else {
+        setActiveTab("ventes");
+      }
+      return;
+    }
+
+    // Redirection Réassort
+    if (type === "reassort" || title.includes("réassort") || title.includes("reassort")) {
+      if (user.role === "stock_caissier") {
+        setActiveTab("reassorts_validation");
+      } else {
+        setActiveTab("mon_stock");
+      }
+      return;
+    }
+
+    // Redirection Validation
+    if (type === "validation" || title.includes("compte") || title.includes("validé")) {
+      if (user.role === "admin") {
+        setActiveTab("utilisateurs");
+      }
+      return;
+    }
+
+    // Redirection Protocole
+    if (type === "protocole" || title.includes("protocole")) {
+      if (user.role === "admin") {
+        setActiveTab("protocoles_validation");
+      } else {
+        setActiveTab("protocoles_vendeur");
+      }
+      return;
+    }
+
+    // Redirection par défaut selon rôle
+    if (user.role === "admin") setActiveTab("dashboard");
+    else if (user.role === "stock_caissier") setActiveTab("magasin_central");
+    else setActiveTab("mon_stock");
+  };
+
+  // --- CALCULE COMPENSATIONS POUR L'AGENT CONNECTÉ (COMMISSIONS STRICTEMENT EN USD) ---
   const compensationAgent = useMemo(() => {
     if (!user) return { fixe: 0, commUSD: 0, commCDF: 0, totalUSD: 0 };
     const matches = ventes.filter(v => v.agent_id === user.id && v.statut_paiement === "valide");
     const isVendeur = user.role === "vendeur";
     const fixe = isVendeur ? 40 : 0;
     const commUSD = matches.reduce((acc, v) => acc + (v.commission_montant || 0), 0);
-    const commCDF = matches.reduce((acc, v) => acc + (v.commission_montant_cdf || 0), 0);
     return {
       fixe,
       commUSD: parseFloat(commUSD.toFixed(2)),
-      commCDF,
-      totalUSD: parseFloat((fixe + commUSD + (commCDF / exchangeRate)).toFixed(2))
+      commCDF: 0,
+      totalUSD: parseFloat((fixe + commUSD).toFixed(2))
     };
-  }, [ventes, user, exchangeRate]);
+  }, [ventes, user]);
 
   // --- RECONSTRUCTION INTERFACE DE BASE (LOGIN / INSCRIPTION / MOT DE PASSE OUBLIÉ) ---
   if (!user) {
     return (
       <div className="min-h-screen flex flex-col justify-center py-12 px-4 sm:px-6 lg:px-8 bg-slate-50 text-slate-900 relative">
-        <div className="sm:mx-auto sm:w-full sm:max-w-md text-center">
-          <div className="inline-flex p-3 bg-emerald-50 rounded-2xl border border-emerald-100 shadow-sm mb-4">
-            <Activity className="h-10 w-10 text-emerald-600 animate-pulse" />
+        <div
+          id="login-logo-container"
+          onClick={() => window.scrollTo(0, 0)}
+          className="sm:mx-auto sm:w-full sm:max-w-md text-center cursor-pointer select-none group"
+          title="Cliquer pour remonter tout en haut"
+        >
+          <div className="inline-flex p-3 bg-emerald-50 rounded-2xl border border-emerald-100 shadow-sm mb-4 transition-transform group-hover:scale-105 active:scale-95">
+            <img
+              src="/logo.png"
+              alt="Logo STOP PALUDISME"
+              onClick={(e) => {
+                e.stopPropagation();
+                window.scrollTo(0, 0);
+              }}
+              className="h-12 w-12 rounded-xl object-contain cursor-pointer"
+              onError={(e) => {
+                e.currentTarget.style.display = 'none';
+                const fb = document.getElementById('login-fallback-icon');
+                if (fb) fb.style.display = 'block';
+              }}
+            />
+            <Activity id="login-fallback-icon" style={{ display: 'none' }} className="h-10 w-10 text-emerald-600 animate-pulse" />
           </div>
-          <h2 className="text-2xl font-black tracking-tight uppercase">STOP PALUDISME</h2>
+          <h2 className="text-2xl font-black tracking-tight uppercase group-hover:text-emerald-700 transition-colors">STOP PALUDISME</h2>
           <p className="mt-1 text-xs text-slate-500 font-medium">Système National de Gestion Intégrée des Stocks et de la Force de Vente</p>
         </div>
 
@@ -2087,119 +2316,173 @@ export default function App() {
       )}
 
       {/* HEADER BANNER GENERAL */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-40 px-4 py-3 shadow-sm/50 transition-colors">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-emerald-600 rounded-xl text-white shadow-sm">
-                <Activity size={18} />
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-40 px-3 sm:px-4 py-2 sm:py-3 shadow-xs transition-colors">
+        <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-2 md:gap-4">
+          {/* LIGNE PRINCIPALE : HAMBURGER + LOGO + NOM (GAUCHE) & ACTIONS MOBILES (DROITE) */}
+          <div className="flex items-center justify-between w-full md:w-auto">
+            <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+              {/* BOUTON MENU HAMBURGER (MOBILE) */}
+              <button
+                type="button"
+                id="btn-mobile-menu"
+                onClick={() => setIsMenuOpen(!isMenuOpen)}
+                className="p-2 -ml-1 text-slate-700 hover:text-emerald-700 hover:bg-emerald-50 active:bg-emerald-100 rounded-xl transition-colors md:hidden cursor-pointer shrink-0 border border-slate-200/80 shadow-xs"
+                title="Menu de navigation"
+                aria-label="Ouvrir le menu"
+              >
+                <Menu size={22} className="text-slate-800" />
+              </button>
+
+              <div
+                id="app-header-logo"
+                onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+                className="flex items-center gap-2.5 cursor-pointer select-none group min-w-0"
+                title="Cliquer pour remonter tout en haut"
+              >
+                <div className="relative flex items-center justify-center shrink-0">
+                  <img
+                    src="/logo.png"
+                    alt="Logo STOP PALUDISME"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      window.scrollTo({ top: 0, behavior: "smooth" });
+                    }}
+                    className="h-8 w-8 sm:h-9 sm:w-9 rounded-xl object-contain shadow-xs border border-emerald-200/70 transition-transform group-hover:scale-105 active:scale-95 cursor-pointer"
+                    onError={(e) => {
+                      e.currentTarget.style.display = 'none';
+                      const fb = document.getElementById('header-fallback-icon');
+                      if (fb) fb.style.display = 'flex';
+                    }}
+                  />
+                  <div
+                    id="header-fallback-icon"
+                    style={{ display: 'none' }}
+                    className="p-2 bg-emerald-600 rounded-xl text-white shadow-sm transition-transform group-hover:scale-105 active:scale-95"
+                  >
+                    <Activity size={18} />
+                  </div>
+                </div>
+                <div
+                  className="truncate"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    window.scrollTo({ top: 0, behavior: "smooth" });
+                  }}
+                >
+                  <h1 className="text-xs sm:text-sm font-black text-slate-900 tracking-tight uppercase group-hover:text-emerald-700 transition-colors leading-tight">
+                    STOP PALUDISME
+                  </h1>
+                  <p className="text-[9px] sm:text-[10px] text-slate-500 font-bold uppercase tracking-wider truncate">
+                    Plateforme d'Indicateurs & Santé
+                  </p>
+                </div>
               </div>
-              <div>
-                <h1 className="text-sm font-black text-slate-900 tracking-tight uppercase">STOP PALUDISME</h1>
-                <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Plateforme d'Indicateurs et de Gestion de la Santé</p>
+            </div>
+
+            {/* BOUTON NOTIFICATION & ACTIONS PARFAITEMENT ALIGNÉS EN HAUT À DROITE SUR MOBILE */}
+            <div className="flex items-center gap-2 md:hidden shrink-0">
+              {(!isOnline || offlineCount > 0) && (
+                <button
+                  type="button"
+                  onClick={handleManualSync}
+                  disabled={isSyncing || !isOnline}
+                  className="p-2 rounded-xl text-xs border border-amber-300 bg-amber-50 text-amber-800"
+                  title={!isOnline ? "Hors-ligne" : "Sync Cloud"}
+                >
+                  <RefreshCw size={15} className={isSyncing ? "animate-spin" : ""} />
+                </button>
+              )}
+
+              {/* CLOCHE NOTIFICATION MOBILE */}
+              <div className="relative">
+                <button
+                  id="btn-notif-mobile"
+                  type="button"
+                  onClick={() => setShowNotifDropdown(!showNotifDropdown)}
+                  className={`relative p-2 rounded-xl border transition-all flex items-center justify-center cursor-pointer ${
+                    showNotifDropdown ? "border-emerald-500 bg-emerald-50 text-emerald-700 shadow-xs" : "border-slate-200 text-slate-600 hover:bg-slate-50 active:bg-slate-100"
+                  }`}
+                  title="Notifications"
+                  aria-label="Notifications"
+                >
+                  <Bell size={18} />
+                  {notifications.count > 0 && (
+                    <span className="absolute -top-1 -right-1 bg-red-500 text-white font-black text-[9px] h-4 w-4 rounded-full flex items-center justify-center border-2 border-white shadow-xs">
+                      {notifications.count}
+                    </span>
+                  )}
+                </button>
               </div>
             </div>
           </div>
 
-          {/* BANNER DU TAUX GLOBAL POUR TOUS LES UTILISATEURS */}
-          <div className="flex flex-wrap items-center gap-2 md:gap-4 justify-end">
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-50 border border-emerald-200 rounded-xl shadow-sm/30">
-              <TrendingUp className="text-emerald-600 shrink-0" size={14} />
-              <span className="text-[11px] font-bold text-slate-600 uppercase">Taux du jour :</span>
-              <span className="text-xs font-black text-emerald-800">1 USD = {exchangeRate} CDF</span>
+          {/* BANNER DESKTOP DU TAUX, NOTIFICATIONS & PROFIL (ET INDICATEUR TAUX MOBILE) */}
+          <div className="flex flex-wrap items-center gap-2 md:gap-4 justify-between md:justify-end w-full md:w-auto">
+            {/* BADGE HORS-LIGNE / BOUTON DE SYNCHRONISATION (DESKTOP) */}
+            {(!isOnline || offlineCount > 0) && (
+              <button
+                type="button"
+                onClick={handleManualSync}
+                disabled={isSyncing || !isOnline}
+                className={`hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-[11px] font-bold border transition-all ${
+                  !isOnline
+                    ? "bg-amber-50 text-amber-800 border-amber-300"
+                    : "bg-emerald-50 text-emerald-800 border-emerald-300 hover:bg-emerald-100 cursor-pointer shadow-xs"
+                }`}
+                title={!isOnline ? "Mode hors-ligne actif. Les ventes sont enregistrées localement sur le téléphone." : "Cliquer pour envoyer les ventes à Supabase"}
+              >
+                <RefreshCw size={12} className={isSyncing ? "animate-spin text-emerald-600" : ""} />
+                <span>
+                  {!isOnline
+                    ? `Hors-ligne (${offlineCount} en attente)`
+                    : isSyncing
+                    ? "Synchronisation..."
+                    : `Sync Cloud (${offlineCount} en attente)`}
+                </span>
+              </button>
+            )}
+
+            {/* TAUX DU JOUR (COMPACT SUR MOBILE, COMPLET SUR DESKTOP) */}
+            <div className="flex items-center gap-2 px-2.5 py-1 sm:px-3 sm:py-1.5 bg-emerald-50 border border-emerald-200 rounded-xl shadow-xs">
+              <TrendingUp className="text-emerald-600 shrink-0" size={13} />
+              <span className="text-[10px] sm:text-[11px] font-bold text-slate-600 uppercase">Taux :</span>
+              <span className="text-[11px] sm:text-xs font-black text-emerald-800">1 USD = {exchangeRate} CDF</span>
               {user.role === "admin" && (
-                <form onSubmit={handleUpdateRate} className="flex items-center gap-1 ml-2 pl-2 border-l border-emerald-200">
+                <form onSubmit={handleUpdateRate} className="hidden sm:flex items-center gap-1 ml-2 pl-2 border-l border-emerald-200">
                   <input
                     type="number"
                     value={rateEditVal}
                     onChange={(e) => setRateEditVal(e.target.value)}
-                    className="w-16 px-1 py-0.5 text-[10px] border border-emerald-300 rounded text-center bg-white text-slate-900"
+                    className="w-16 px-1 py-0.5 text-[10px] border border-emerald-300 rounded text-center bg-white text-slate-900 font-bold"
                   />
-                  <button type="submit" disabled={rateLoading} className="p-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded">
+                  <button type="submit" disabled={rateLoading} className="p-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded cursor-pointer">
                     <Check size={8} />
                   </button>
                 </form>
               )}
             </div>
 
-            {/* NOTIFICATION ICON WITH CONTEXTUAL ALERTS */}
-            <div className="relative">
+            {/* NOTIFICATION ICON WITH CONTEXTUAL ALERTS (DESKTOP) */}
+            <div className="relative hidden md:block">
               <button
+                type="button"
                 onClick={() => setShowNotifDropdown(!showNotifDropdown)}
-                className={`relative p-2 rounded-xl border transition-all flex items-center justify-center hover:bg-slate-50:bg-slate-800 ${showNotifDropdown ? "border-emerald-500 bg-emerald-50/20 text-emerald-700" : "border-slate-150 text-slate-500"}`}
+                className={`relative p-2 rounded-xl border transition-all flex items-center justify-center cursor-pointer ${
+                  showNotifDropdown ? "border-emerald-500 bg-emerald-50 text-emerald-700" : "border-slate-200 text-slate-500 hover:bg-slate-50"
+                }`}
                 title={user.role === "stock_caissier" ? "Alertes d'Approvisionnement" : "Notifications"}
               >
                 <Bell size={16} />
                 {notifications.count > 0 && (
-                  <span className="absolute -top-1 -right-1 bg-red-500 text-white font-black text-[9px] h-4 w-4 rounded-full flex items-center justify-center border border-white">
+                  <span className="absolute -top-1 -right-1 bg-red-500 text-white font-black text-[9px] h-4 w-4 rounded-full flex items-center justify-center border-2 border-white shadow-xs">
                     {notifications.count}
                   </span>
                 )}
               </button>
-
-              {/* DROPDOWN MENU */}
-              {showNotifDropdown && (
-                <div className="absolute right-0 mt-2 w-80 bg-white rounded-xl shadow-xl border border-slate-100 py-3 z-50 animate-in fade-in slide-in-from-top-2 duration-150">
-                  <div className="px-4 pb-2 border-b border-slate-100 flex items-center justify-between">
-                    <h4 className="text-[10px] font-black uppercase text-slate-500 tracking-wider">
-                      {user.role === "stock_caissier" ? "🔔 Alertes Approvisionnement" : "🔔 Vos Notifications"}
-                    </h4>
-                    {notifications.count > 0 && (
-                      <span className="text-[9px] font-bold bg-red-100 text-red-600 px-1.5 py-0.5 rounded-md">
-                        {notifications.count} Active(s)
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="max-h-60 overflow-y-auto divide-y divide-slate-50 px-2 mt-1">
-                    {notifications.items.length === 0 ? (
-                       <div className="py-6 text-center text-xs text-slate-400 font-medium">
-                        Aucune notification pour le moment.
-                      </div>
-                    ) : (
-                      notifications.items.map((item: any) => (
-                        <button
-                          key={item.id}
-                          type="button"
-                          onClick={() => {
-                            setShowNotifDropdown(false);
-                            if (item.productId) {
-                              setHighlightedProductId(item.productId);
-                              if (user.role === "stock_caissier") {
-                                setActiveTab("magasin_central");
-                              } else {
-                                setActiveTab("mon_stock");
-                              }
-                              setTimeout(() => {
-                                setHighlightedProductId(null);
-                              }, 4000);
-                            } else if (item.type === "reassort_demande") {
-                              setActiveTab("reassorts_validation");
-                            } else if (user.role === "admin") {
-                              setActiveTab("dashboard");
-                            } else if (user.role === "stock_caissier") {
-                              setActiveTab("magasin_central");
-                            } else {
-                              setActiveTab("mon_stock");
-                            }
-                          }}
-                          className="w-full p-2.5 hover:bg-slate-50:bg-slate-800 rounded-lg transition-colors text-left block cursor-pointer border-l-2 border-transparent hover:border-emerald-500"
-                        >
-                          <p className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                            {item.title}
-                          </p>
-                          <p className="text-[10px] text-slate-500 mt-1 font-medium">{item.desc}</p>
-                          <p className="text-[8px] text-slate-400 mt-1.5 text-right font-semibold">{item.date}</p>
-                        </button>
-                      ))
-                    )}
-                  </div>
-                </div>
-              )}
             </div>
 
-            {/* DETAILS UTILISATEUR CONNECTÉ */}
-            <div className="flex items-center gap-2 border-l border-slate-200 pl-4">
+            {/* DETAILS UTILISATEUR CONNECTÉ (DESKTOP) */}
+            <div className="hidden md:flex items-center gap-2 border-l border-slate-200 pl-4">
               <span className={`px-2 py-0.5 border rounded-lg text-[9px] font-bold uppercase tracking-wider ${ROLE_COLORS[user.role]}`}>
                 {ROLE_LABELS[user.role]}
               </span>
@@ -2207,23 +2490,292 @@ export default function App() {
                 <p className="text-xs font-bold text-slate-800">{user.name}</p>
                 <p className="text-[9px] text-slate-400 font-semibold">{user.email}</p>
               </div>
+            </div>
+          </div>
+
+          {/* DROPDOWN MENU NOTIFICATIONS (UNIFIÉ MOBILE & DESKTOP) */}
+          {showNotifDropdown && (
+            <div className="absolute right-3 sm:right-6 top-14 sm:top-16 w-76 sm:w-84 max-w-[92vw] bg-white rounded-2xl shadow-2xl border border-slate-200/80 py-3 z-50 animate-in fade-in zoom-in-95 duration-150">
+              <div className="px-4 pb-2 border-b border-slate-100 flex items-center justify-between">
+                <h4 className="text-[10px] font-black uppercase text-slate-500 tracking-wider">
+                  {user.role === "stock_caissier" ? "🔔 Alertes Approvisionnement" : "🔔 Vos Notifications"}
+                </h4>
+                {notifications.count > 0 && (
+                  <span className="text-[9px] font-bold bg-red-100 text-red-600 px-1.5 py-0.5 rounded-md">
+                    {notifications.count} Active(s)
+                  </span>
+                )}
+              </div>
+
+              <div className="max-h-64 overflow-y-auto divide-y divide-slate-50 px-2 mt-1">
+                {notifications.items.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-slate-400 font-medium">
+                    Aucune notification pour le moment.
+                  </div>
+                ) : (
+                  notifications.items.map((item: any) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => handleNotificationClick(item)}
+                      className={`w-full p-2.5 rounded-lg transition-colors text-left block cursor-pointer border-l-2 ${
+                        item.lu
+                          ? "opacity-60 bg-white hover:bg-slate-50 border-transparent text-slate-600"
+                          : "bg-emerald-50/40 hover:bg-emerald-50 border-emerald-500 text-slate-900 font-medium"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <p className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          {item.title}
+                        </p>
+                        {!item.lu && (
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 inline-block" title="Non lue" />
+                        )}
+                      </div>
+                      <p className="text-[10px] text-slate-500 mt-1 font-medium">{item.desc}</p>
+                      <p className="text-[8px] text-slate-400 mt-1.5 text-right font-semibold">{item.date}</p>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </header>
+
+      {/* SIDEBAR MOBILE SLIDE-OVER (DRAWER HAMBURGER) */}
+      {isMenuOpen && (
+        <div className="fixed inset-0 z-50 md:hidden flex animate-in fade-in duration-150">
+          {/* Backdrop sombre avec fermeture au clic */}
+          <div
+            className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs transition-opacity cursor-pointer"
+            onClick={() => setIsMenuOpen(false)}
+          />
+
+          {/* Tiroir de navigation latéral */}
+          <div className="relative w-72 max-w-[85vw] bg-white h-full shadow-2xl flex flex-col z-10 animate-in slide-in-from-left duration-200">
+            {/* Header du tiroir */}
+            <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-emerald-50/50">
+              <div className="flex items-center gap-2.5">
+                <img
+                  src="/logo.png"
+                  alt="Logo STOP PALUDISME"
+                  className="h-8 w-8 rounded-xl object-contain border border-emerald-200"
+                  onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                />
+                <div>
+                  <h3 className="text-xs font-black text-slate-900 uppercase tracking-tight">STOP PALUDISME</h3>
+                  <p className="text-[9px] font-bold text-emerald-700 uppercase">Navigation Mobile</p>
+                </div>
+              </div>
               <button
-                onClick={handleLogout}
-                className="p-1.5 text-slate-400 hover:text-red-500 rounded-lg hover:bg-red-50:bg-red-950/40 transition-colors ml-1"
-                title="Se déconnecter"
+                type="button"
+                onClick={() => setIsMenuOpen(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
+                title="Fermer le menu"
               >
-                <LogOut size={15} />
+                <X size={20} />
+              </button>
+            </div>
+
+            {/* Profil rapide de l'agent (sans bouton logout dans la barre latérale) */}
+            <div className="px-4 py-3 bg-slate-50 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <p className="text-xs font-bold text-slate-800">{user.name}</p>
+                <span className={`inline-block mt-0.5 px-2 py-0.5 border rounded-md text-[8px] font-bold uppercase tracking-wider ${ROLE_COLORS[user.role]}`}>
+                  {ROLE_LABELS[user.role]}
+                </span>
+              </div>
+              <span className="text-[10px] font-extrabold text-emerald-700 bg-emerald-100/60 px-2 py-0.5 rounded-md border border-emerald-200">
+                Connecté
+              </span>
+            </div>
+
+            {/* Liste des liens de navigation avec fermeture automatique au clic */}
+            <div className="flex-1 overflow-y-auto p-3 space-y-1">
+              {user.role === "admin" && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("dashboard"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "dashboard" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <TrendingUp size={16} /> Cockpit Global
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("catalogue"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "catalogue" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <ShoppingBag size={16} /> Catalogue & Stocks
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("protocoles_validation"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "protocoles_validation" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <ClipboardList size={16} /> Validation Protocoles
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("paies_admin"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "paies_admin" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <FileSpreadsheet size={16} /> Fiches de Paie
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("utilisateurs"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "utilisateurs" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <Users size={16} /> Utilisateurs (Roles)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("tous_clients"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "tous_clients" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <Users size={16} /> Tous les Clients
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("historique_general"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "historique_general" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <span>📜</span> Historique Général & Transactions
+                  </button>
+                </>
+              )}
+
+              {user.role === "vendeur" && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("ventes"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "ventes" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <ShoppingBag size={16} /> Nouvelle Vente
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("protocoles_vendeur"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "protocoles_vendeur" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <Building size={16} /> Protocole d'Entreprise
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("mon_stock"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "mon_stock" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <Package size={16} /> Mon Stock & Réassort
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("mon_solde"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "mon_solde" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <Coins size={16} /> Mon Solde ($40 + {currentCommissionRate}%)
+                  </button>
+                </>
+              )}
+
+              {user.role === "distributeur" && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("ventes"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "ventes" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <ShoppingBag size={16} /> Ventes Point Fixe
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("mon_stock"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "mon_stock" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <Package size={16} /> Stock Dépôt & Réassort
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("mon_solde"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "mon_solde" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <Coins size={16} /> Mon Solde (0$ + {currentCommissionRate}%)
+                  </button>
+                </>
+              )}
+
+              {user.role === "stock_caissier" && (
+                <>
+                  <div className="px-3 py-1 text-[9px] font-bold uppercase text-slate-400 tracking-wider">Logistique</div>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("magasin_central"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "magasin_central" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <Building size={16} /> Magasin Central
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("reassorts_validation"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "reassorts_validation" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <ClipboardList size={16} /> Demandes Réassort
+                  </button>
+
+                  <div className="px-3 py-1 text-[9px] font-bold uppercase text-slate-400 tracking-wider mt-2">Finance & Caisse</div>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("validation_reglements"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "validation_reglements" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <CheckCircle2 size={16} /> Valider Règlements
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setActiveTab("validation_paies"); setIsMenuOpen(false); }}
+                    className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "validation_paies" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                  >
+                    <Coins size={16} /> Valider Paies & Commissions
+                  </button>
+                </>
+              )}
+
+              <div className="pt-2 mt-2 border-t border-slate-100 space-y-1">
+                <button
+                  type="button"
+                  onClick={() => { setActiveTab("parametres"); setIsMenuOpen(false); }}
+                  className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5 cursor-pointer ${activeTab === "parametres" ? "bg-emerald-600 text-white shadow-sm" : "text-slate-700 hover:bg-slate-100"}`}
+                >
+                  <Settings size={16} /> Paramètres & Profil
+                </button>
+              </div>
+            </div>
+
+            {/* Actualiser les données en bas du tiroir mobile */}
+            <div className="p-3 border-t border-slate-100 bg-slate-50">
+              <button
+                type="button"
+                onClick={() => {
+                  loadAllData();
+                  setIsMenuOpen(false);
+                }}
+                className="w-full py-2.5 px-3 bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-xs cursor-pointer"
+              >
+                <RefreshCw size={14} className={loadingData ? "animate-spin text-emerald-600" : ""} />
+                <span>{loadingData ? "Actualisation..." : "Actualiser"}</span>
               </button>
             </div>
           </div>
         </div>
-      </header>
+      )}
 
       {/* CORE NAVIGATION DE L'APPLICATION SELON LE RÔLE */}
       <div className="max-w-7xl mx-auto w-full px-4 py-6 flex-1 flex flex-col md:flex-row gap-6">
-        {/* SIDEBAR NAVIGATION BAR */}
-        <aside className="w-full md:w-56 shrink-0">
-          <div className="bg-white border border-slate-150 rounded-xl p-4 shadow-sm/30 sticky top-20 flex flex-row md:flex-col overflow-x-auto gap-1 transition-colors">
+        {/* SIDEBAR NAVIGATION BAR (VISIBLE SUR DESKTOP, MASQUÉE SUR MOBILE) */}
+        <aside className="hidden md:block w-56 shrink-0">
+          <div className="bg-white border border-slate-150 rounded-xl p-4 shadow-sm/30 sticky top-20 flex flex-col gap-1 transition-colors">
             {user.role === "admin" && (
               <>
                 <button
@@ -2399,7 +2951,7 @@ export default function App() {
                               Attention : Il ne reste que {remainingDays} jours pour le paiement du protocole {p.institution} !
                             </p>
                             <p className="text-[10px] font-semibold text-amber-500 mt-1">
-                              Dette restante : {(p.montant_du_usd - p.montant_paye_usd).toFixed(2)} USD / {(p.montant_du_cdf - p.montant_paye_cdf).toLocaleString()} CDF
+                              Dette restante : {((p.montant_du_usd || 0) - (p.montant_paye_usd || 0)).toFixed(2)} USD / {(((p.montant_du_cdf || 0) - (p.montant_paye_cdf || 0))).toLocaleString()} CDF
                             </p>
                           </div>
                         </div>
@@ -2835,15 +3387,11 @@ export default function App() {
                     </div>
                     <div className="flex justify-between p-2.5 bg-slate-50 rounded-lg">
                       <span className="text-xs font-bold text-slate-500">Commissions cumulées ({currentCommissionRate}%) :</span>
-                      <span className="text-xs font-black text-slate-700">{compensationAgent.commUSD} $</span>
-                    </div>
-                    <div className="flex justify-between p-2.5 bg-slate-50 rounded-lg">
-                      <span className="text-xs font-bold text-slate-500">Commissions CDF cumulées :</span>
-                      <span className="text-xs font-black text-emerald-700">{compensationAgent.commCDF.toLocaleString()} CDF</span>
+                      <span className="text-xs font-black text-emerald-700">{compensationAgent.commUSD.toFixed(2)} $</span>
                     </div>
                     <div className="pt-3 border-t border-slate-150 flex justify-between items-center">
-                      <span className="text-xs font-black text-slate-800">Total estimé (USD) :</span>
-                      <span className="text-sm font-black text-emerald-600">{compensationAgent.totalUSD} $</span>
+                      <span className="text-xs font-black text-slate-800">Solde Total Dû (USD) :</span>
+                      <span className="text-sm font-black text-emerald-600">{compensationAgent.totalUSD.toFixed(2)} $</span>
                     </div>
                   </div>
                 </div>
@@ -2917,15 +3465,11 @@ export default function App() {
                   </div>
                   <div className="flex justify-between p-2.5 bg-slate-50 rounded-lg">
                     <span className="text-xs font-bold text-slate-500">Commissions cumulées ({currentCommissionRate}%) :</span>
-                    <span className="text-xs font-black text-slate-700">{compensationAgent.commUSD} $</span>
-                  </div>
-                  <div className="flex justify-between p-2.5 bg-slate-50 rounded-lg">
-                    <span className="text-xs font-bold text-slate-500">Commissions CDF cumulées :</span>
-                    <span className="text-xs font-black text-emerald-700">{compensationAgent.commCDF.toLocaleString()} CDF</span>
+                    <span className="text-xs font-black text-emerald-700">{compensationAgent.commUSD.toFixed(2)} $</span>
                   </div>
                   <div className="pt-3 border-t border-slate-150 flex justify-between items-center">
-                    <span className="text-xs font-black text-slate-800">Total estimé (USD) :</span>
-                    <span className="text-sm font-black text-emerald-600">{compensationAgent.totalUSD} $</span>
+                    <span className="text-xs font-black text-slate-800">Solde Total Dû (USD) :</span>
+                    <span className="text-sm font-black text-emerald-600">{compensationAgent.totalUSD.toFixed(2)} $</span>
                   </div>
                 </div>
               </div>
@@ -3731,7 +4275,7 @@ export default function App() {
                         <td className={`${STYLES.tableTd} font-bold`}>{v.client_nom}</td>
                         <td className={STYLES.tableTd}>{v.agent_nom}</td>
                         <td className={`${STYLES.tableTd} font-black text-emerald-800`}>
-                          {v.total.toFixed(2)} USD / {v.total_cdf?.toLocaleString()} CDF
+                          {(v.total || 0).toFixed(2)} USD / {(v.total_cdf ?? Math.round((v.total || 0) * exchangeRate)).toLocaleString()} CDF
                         </td>
                         <td className={`${STYLES.tableTd} font-bold uppercase`}>{v.type_paiement}</td>
                         <td className={STYLES.tableTd}>
@@ -3786,7 +4330,7 @@ export default function App() {
                         <td className={STYLES.tableTd}>{f.ventes_count} Ventes</td>
                         <td className={STYLES.tableTd}>{f.salaire_fixe || 0} USD</td>
                         <td className={`${STYLES.tableTd} font-black text-emerald-800`}>
-                          {f.total_commission_usd} USD + {f.total_commission_cdf.toLocaleString()} CDF
+                          {(f.total_commission_usd || 0).toFixed(2)} USD
                         </td>
                         <td className={STYLES.tableTd}>
                           {f.statut === "en_attente" ? (
@@ -3876,8 +4420,8 @@ export default function App() {
                     );
                   }
 
-                  const detteUSD = p.montant_du_usd - p.montant_paye_usd;
-                  const detteCDF = p.montant_du_cdf - p.montant_paye_cdf;
+                  const detteUSD = (p.montant_du_usd || 0) - (p.montant_paye_usd || 0);
+                  const detteCDF = (p.montant_du_cdf || 0) - (p.montant_paye_cdf || 0);
                   const hasDette = detteUSD > 0.01;
 
                   return (
@@ -3928,7 +4472,7 @@ export default function App() {
                             <div>
                               <p className="text-xs font-black text-red-900 uppercase">Attention : Dette active</p>
                               <p className="text-xs font-bold text-red-700 mt-0.5">
-                                Ce protocole présente un solde impayé de {detteUSD.toFixed(2)} USD / {detteCDF.toLocaleString()} CDF.
+                                Ce protocole présente un solde impayé de {detteUSD.toFixed(2)} USD / {(detteCDF || 0).toLocaleString()} CDF.
                               </p>
                             </div>
                           </div>
@@ -3950,7 +4494,7 @@ export default function App() {
                             <p className={`font-extrabold mt-1 ${hasDette ? "text-red-600" : "text-slate-600"}`}>
                               {detteUSD.toFixed(2)} USD
                             </p>
-                            <p className="text-[10px] text-slate-500">≈ {detteCDF.toLocaleString()} CDF</p>
+                            <p className="text-[10px] text-slate-500">≈ {(detteCDF || 0).toLocaleString()} CDF</p>
                           </div>
                           <div>
                             <p className="text-slate-400 font-bold uppercase text-[9px]">Échéance de paiement</p>
@@ -4863,9 +5407,9 @@ export default function App() {
                               )}
                               {u.id !== "u-admin" && u.email !== "admin@stoppaludisme.cd" ? (
                                 <button
-                                  onClick={() => handleDeleteUser(u.id)}
+                                  onClick={() => handleDeleteUser(u)}
                                   className="p-1 text-red-500 hover:bg-red-50 rounded transition-colors"
-                                  title="Supprimer le compte"
+                                  title="Supprimer définitivement ce compte de Supabase"
                                 >
                                   <Trash2 size={13} />
                                 </button>
@@ -5184,6 +5728,27 @@ export default function App() {
                     <p className="font-bold text-slate-800">Numéro RCCM & Identifiants :</p>
                     <p>RCCM CD/BKV/RCCM/23-A-01-303 &bull; Tél: +243 975 423 371</p>
                   </div>
+                </div>
+              </div>
+
+              {/* ESPACE DÉCONNEXION SÉCURISÉE */}
+              <div className={`${STYLES.card} border-red-200 bg-red-50/20`}>
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                  <div>
+                    <h4 className="text-xs font-black uppercase text-red-700 tracking-wider flex items-center gap-2">
+                      <LogOut size={16} /> Déconnexion de la Session
+                    </h4>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Fermez votre session active sur cet appareil en toute sécurité.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleLogout}
+                    className="px-5 py-2.5 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-xl text-xs font-black transition-all shadow-sm flex items-center justify-center gap-2 cursor-pointer shrink-0"
+                  >
+                    <LogOut size={15} /> Se déconnecter
+                  </button>
                 </div>
               </div>
             </div>
@@ -5612,7 +6177,7 @@ export default function App() {
                           type: "Vente",
                           agent: v.agent_nom,
                           details: `Vente au client "${v.client_nom}" (Kits: ${v.details || "Articles"}) &middot; Mode: ${v.type_paiement}`,
-                          montant: `${v.total.toFixed(2)} USD / ${v.total_cdf?.toLocaleString()} CDF`,
+                          montant: `${(v.total || 0).toFixed(2)} USD / ${(v.total_cdf ?? Math.round((v.total || 0) * exchangeRate)).toLocaleString()} CDF`,
                           origin: v
                         });
                       });
@@ -5802,19 +6367,19 @@ export default function App() {
                 <div className="p-3 bg-slate-50 border border-slate-100 rounded-xl">
                   <p className="text-[9px] text-slate-400 font-black uppercase">Total Dû</p>
                   <p className="text-xs font-black text-slate-700 mt-1">
-                    {selectedSellerProtocol.montant_du_usd.toFixed(2)} $
+                    {(selectedSellerProtocol.montant_du_usd || 0).toFixed(2)} $
                   </p>
                   <p className="text-[10px] text-slate-400 font-bold">
-                    {selectedSellerProtocol.montant_du_cdf.toLocaleString()} CDF
+                    {(selectedSellerProtocol.montant_du_cdf || 0).toLocaleString()} CDF
                   </p>
                 </div>
                 <div className="p-3 bg-slate-50 border border-slate-100 rounded-xl">
                   <p className="text-[9px] text-slate-400 font-black uppercase">Total Payé</p>
                   <p className="text-xs font-black text-emerald-600 mt-1">
-                    {selectedSellerProtocol.montant_paye_usd.toFixed(2)} $
+                    {(selectedSellerProtocol.montant_paye_usd || 0).toFixed(2)} $
                   </p>
                   <p className="text-[10px] text-emerald-600/80 font-semibold">
-                    {selectedSellerProtocol.montant_paye_cdf.toLocaleString()} CDF
+                    {(selectedSellerProtocol.montant_paye_cdf || 0).toLocaleString()} CDF
                   </p>
                 </div>
                 <div className="p-3 bg-slate-50 border border-slate-100 rounded-xl">
@@ -5834,10 +6399,10 @@ export default function App() {
               {/* LISTE DES BÉNÉFICIAIRES */}
               <div className="border border-slate-150 rounded-xl p-4 bg-white space-y-3">
                 <h4 className="text-xs font-black uppercase text-slate-700 tracking-wider">
-                  Bénéficiaires enregistrés ({selectedSellerProtocol.beneficiaires.length})
+                  Bénéficiaires enregistrés ({selectedSellerProtocol.beneficiaires?.length || 0})
                 </h4>
                 <div className="divide-y divide-slate-100 max-h-52 overflow-y-auto pr-1">
-                  {selectedSellerProtocol.beneficiaires.length === 0 ? (
+                  {(!selectedSellerProtocol.beneficiaires || selectedSellerProtocol.beneficiaires.length === 0) ? (
                     <p className="text-xs text-slate-400 text-center py-4">Aucun bénéficiaire dans ce protocole.</p>
                   ) : (
                     selectedSellerProtocol.beneficiaires.map((b, idx) => (
@@ -5853,7 +6418,7 @@ export default function App() {
                             {b.produits?.map((pr) => `${pr.quantite}x ${pr.produit_nom}`).join(", ")}
                           </p>
                           <p className="text-[10px] text-slate-400 mt-0.5 font-bold">
-                            Total : {b.total_usd.toFixed(2)} $ ({b.total_cdf.toLocaleString()} CDF)
+                            Total : {(b.total_usd || 0).toFixed(2)} $ ({(b.total_cdf || 0).toLocaleString()} CDF)
                           </p>
                         </div>
                       </div>
@@ -6011,15 +6576,10 @@ export default function App() {
       {activeFacture && (() => {
         const salaireFixe = activeFacture.salaire_fixe || 40;
         const commissionsUsd = activeFacture.total_commission_usd || 0;
-        const commissionsCdf = activeFacture.total_commission_cdf || 0;
         const brutUsd = salaireFixe + commissionsUsd;
-        const brutCdf = commissionsCdf;
         
         const tvaUsd = brutUsd * 0.15;
-        const tvaCdf = brutCdf * 0.15;
-        
         const netUsd = brutUsd - tvaUsd;
-        const netCdf = brutCdf - tvaCdf;
 
         const agentVentesCount = ventes.filter(v => v.agent_id === activeFacture.agent_id && v.statut_paiement === "valide").length;
         const agentProtocolesCount = protocoles.filter(p => p.agent_id === activeFacture.agent_id && p.statut === "valide").length;
@@ -6069,7 +6629,6 @@ export default function App() {
                         <th style={{ border: "1px solid #cbd5e1", padding: "8px", textAlign: "left", fontSize: "10px", textTransform: "uppercase" }}>Désignation Rubrique</th>
                         <th style={{ border: "1px solid #cbd5e1", padding: "8px", textAlign: "right", fontSize: "10px", textTransform: "uppercase" }}>Quantité / Base</th>
                         <th style={{ border: "1px solid #cbd5e1", padding: "8px", textAlign: "right", fontSize: "10px", textTransform: "uppercase" }}>Gains / Retenues (USD)</th>
-                        <th style={{ border: "1px solid #cbd5e1", padding: "8px", textAlign: "right", fontSize: "10px", textTransform: "uppercase" }}>Gains / Retenues (CDF)</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -6077,43 +6636,31 @@ export default function App() {
                         <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px" }}>Salaire de Base Fixe de terrain</td>
                         <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>1 Mois</td>
                         <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{salaireFixe.toFixed(2)} USD</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>-</td>
                       </tr>
                       <tr>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px" }}>Commissions cumulées sur moustiquaires ($)</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{agentVentesCount} Ventes</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{commissionsUsd.toFixed(2)} USD</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>-</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px" }}>Commissions cumulées sur ventes directes & protocoles ($)</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{agentVentesCount} Vente(s)</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right", color: "#059669", fontWeight: "bold" }}>+{commissionsUsd.toFixed(2)} USD</td>
                       </tr>
                       <tr>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px" }}>Commissions cumulées sur consommables (FC)</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{agentVentesCount} Ventes</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>-</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{commissionsCdf.toLocaleString()} CDF</td>
-                      </tr>
-                      <tr>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px" }}>Protocoles apportés (Validation)</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{agentProtocolesCount} Actifs</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>-</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>-</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px" }}>Protocoles d'Entreprise apportés</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{agentProtocolesCount} Dossier(s)</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>Inclus</td>
                       </tr>
                       <tr style={{ fontWeight: "bold", backgroundColor: "#f8fafc" }}>
                         <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px" }}>SALAIRE BRUT TOTAL DÛ</td>
                         <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>Brut</td>
                         <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{brutUsd.toFixed(2)} USD</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>{brutCdf.toLocaleString()} CDF</td>
                       </tr>
                       <tr style={{ fontStyle: "italic", color: "#ef4444" }}>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px" }}>Déduction de la TVA (15%) sur salaire</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>15% d'impôt</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px" }}>Déduction fiscale légale (15%) sur gains</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>15%</td>
                         <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right", color: "#ef4444" }}>-{tvaUsd.toFixed(2)} USD</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right", color: "#ef4444" }}>-{tvaCdf.toLocaleString()} CDF</td>
                       </tr>
                       <tr style={{ fontWeight: "bold", backgroundColor: "#f0fdf4" }}>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", color: "#16a34a" }}>NET À PAYER TOTAL (NET DE TVA)</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right", color: "#16a34a" }}>Net net</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right", color: "#16a34a" }}>{netUsd.toFixed(2)} USD</td>
-                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right", color: "#16a34a" }}>{netCdf.toLocaleString()} CDF</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", color: "#16a34a" }}>NET À PAYER TOTAL (EN USD)</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right", color: "#16a34a" }}>Net à verser</td>
+                        <td style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "11px", textAlign: "right", color: "#16a34a", fontWeight: "900" }}>{netUsd.toFixed(2)} USD</td>
                       </tr>
                     </tbody>
                   </table>
@@ -6337,22 +6884,22 @@ export default function App() {
                     <tr style={{ fontWeight: "bold", backgroundColor: "#f1f5f9" }}>
                       <td colSpan={6} style={{ border: "1px solid #cbd5e1", padding: "10px", fontSize: "11px", textAlign: "right", textTransform: "uppercase" }}>PRIX TOTAL CUMULÉ DU PROTOCOLE :</td>
                       <td colSpan={2} style={{ border: "1px solid #cbd5e1", padding: "10px", fontSize: "11px", textAlign: "right", color: "#059669", fontWeight: "900" }}>
-                        {selectedProtocolForFiche.montant_du_usd?.toFixed(2)} USD <br/>
-                        <span style={{ fontSize: "10px", color: "#475569" }}>≈ {selectedProtocolForFiche.montant_du_cdf?.toLocaleString()} CDF</span>
+                        {(selectedProtocolForFiche.montant_du_usd || 0).toFixed(2)} USD <br/>
+                        <span style={{ fontSize: "10px", color: "#475569" }}>≈ {(selectedProtocolForFiche.montant_du_cdf || 0).toLocaleString()} CDF</span>
                       </td>
                     </tr>
                     <tr style={{ fontWeight: "bold", backgroundColor: "#f8fafc" }}>
-                      <td colSpan={6} style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>TOTAL DES ACOMPTES PAYÉS :</td>
+                       <td colSpan={6} style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>TOTAL DES ACOMPTES PAYÉS :</td>
                       <td colSpan={2} style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right", color: "#16a34a" }}>
-                        {selectedProtocolForFiche.montant_paye_usd?.toFixed(2)} USD <br/>
-                        <span style={{ fontSize: "9px" }}>≈ {selectedProtocolForFiche.montant_paye_cdf?.toLocaleString()} CDF</span>
+                        {(selectedProtocolForFiche.montant_paye_usd || 0).toFixed(2)} USD <br/>
+                        <span style={{ fontSize: "9px" }}>≈ {(selectedProtocolForFiche.montant_paye_cdf || 0).toLocaleString()} CDF</span>
                       </td>
                     </tr>
                     <tr style={{ fontWeight: "bold", backgroundColor: "#fff" }}>
                       <td colSpan={6} style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right" }}>SOLDE RESTANT DÛ :</td>
                       <td colSpan={2} style={{ border: "1px solid #cbd5e1", padding: "8px", fontSize: "10px", textAlign: "right", color: "#dc2626" }}>
-                        {(selectedProtocolForFiche.montant_du_usd - selectedProtocolForFiche.montant_paye_usd).toFixed(2)} USD <br/>
-                        <span style={{ fontSize: "9px" }}>≈ {(selectedProtocolForFiche.montant_du_cdf - selectedProtocolForFiche.montant_paye_cdf).toLocaleString()} CDF</span>
+                        {((selectedProtocolForFiche.montant_du_usd || 0) - (selectedProtocolForFiche.montant_paye_usd || 0)).toFixed(2)} USD <br/>
+                        <span style={{ fontSize: "9px" }}>≈ {(((selectedProtocolForFiche.montant_du_cdf || 0) - (selectedProtocolForFiche.montant_paye_cdf || 0))).toLocaleString()} CDF</span>
                       </td>
                     </tr>
                   </tbody>
@@ -6377,12 +6924,242 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* MODAL VALIDATION ET ACTIVATION DE COMPTE (ADMIN) */}
+      {validatingUser && (
+        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex justify-between items-center pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <div className="p-2 bg-emerald-100 text-emerald-700 rounded-xl">
+                  <UserCheck size={18} />
+                </div>
+                <div>
+                  <h3 className="text-sm font-black uppercase text-slate-800">Valider & Activer le Compte</h3>
+                  <p className="text-[11px] text-slate-500">Attribuer rôle et commission</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setValidatingUser(null)}
+                className="p-1 hover:bg-slate-100 rounded-lg text-slate-400 cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="py-4 space-y-4">
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-150 space-y-1">
+                <p className="text-xs font-bold text-slate-800">{validatingUser.name}</p>
+                <p className="text-[11px] text-slate-600 flex items-center gap-1.5">
+                  <span className="font-semibold text-slate-500">Email:</span> {validatingUser.email}
+                </p>
+                {validatingUser.telephone && (
+                  <p className="text-[11px] text-slate-600 flex items-center gap-1.5">
+                    <span className="font-semibold text-slate-500">Tél:</span> {validatingUser.telephone}
+                  </p>
+                )}
+                {validatingUser.quartier && (
+                  <p className="text-[11px] text-slate-600 flex items-center gap-1.5">
+                    <span className="font-semibold text-slate-500">Quartier:</span> {validatingUser.quartier}
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold uppercase text-slate-700 mb-1">
+                  Rôle de l'agent :
+                </label>
+                <select
+                  value={validationRole}
+                  onChange={(e) => {
+                    const r = e.target.value as UserRole;
+                    setValidationRole(r);
+                    if (r === "distributeur") setValidationCommission(20);
+                    else if (r === "vendeur") setValidationCommission(15);
+                    else setValidationCommission(0);
+                  }}
+                  className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 bg-white font-medium text-slate-800"
+                >
+                  <option value="vendeur">Vendeur Terrain (Défaut 15% + fixe $40)</option>
+                  <option value="distributeur">Distributeur Grossiste (Défaut 20%)</option>
+                  <option value="stock_caissier">Responsable Stock & Caisse</option>
+                  <option value="admin">Administrateur</option>
+                </select>
+              </div>
+
+              {(validationRole === "vendeur" || validationRole === "distributeur") && (
+                <div>
+                  <label className="block text-[11px] font-bold uppercase text-slate-700 mb-1">
+                    Taux de Commission (%) :
+                  </label>
+                  <div className="relative">
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      value={validationCommission}
+                      onChange={(e) => setValidationCommission(parseFloat(e.target.value) || 0)}
+                      className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 font-bold text-slate-800"
+                    />
+                    <span className="absolute right-3 top-2 text-xs font-bold text-slate-400">%</span>
+                  </div>
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    {validationRole === "vendeur" ? "Taux standard vendeur : 15%." : "Taux standard distributeur : 20%."}
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setValidatingUser(null)}
+                className="px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                disabled={validationLoading}
+                onClick={handleValidateUserSubmit}
+                className="px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl transition-all shadow-sm flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {validationLoading ? (
+                  <>
+                    <RefreshCw size={13} className="animate-spin" /> Activation...
+                  </>
+                ) : (
+                  <>
+                    <Check size={14} /> Confirmer l'Activation
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL REJET DEMANDE UTILISATEUR (ADMIN) */}
+      {rejectingUser && (
+        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center gap-3 pb-3 border-b border-slate-100">
+              <div className="p-2 bg-red-100 text-red-700 rounded-xl">
+                <UserX size={20} />
+              </div>
+              <div>
+                <h3 className="text-sm font-black uppercase text-slate-800">Rejeter la demande d'accès</h3>
+                <p className="text-[11px] text-slate-500">Refus d'accès à la plateforme</p>
+              </div>
+            </div>
+
+            <div className="py-4">
+              <p className="text-xs text-slate-700 leading-relaxed">
+                Êtes-vous certain de vouloir rejeter la demande d'inscription de <strong className="text-slate-900">{rejectingUser.name}</strong> ({rejectingUser.email}) ?
+              </p>
+              <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-800 font-medium">
+                Cet utilisateur ne pourra pas se connecter à l'application. Son statut sera marqué comme rejeté.
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setRejectingUser(null)}
+                className="px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                disabled={validationLoading}
+                onClick={handleConfirmRejectUser}
+                className="px-4 py-2 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded-xl transition-all shadow-sm flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {validationLoading ? (
+                  <>
+                    <RefreshCw size={13} className="animate-spin" /> Traitement...
+                  </>
+                ) : (
+                  <>
+                    <X size={14} /> Confirmer le Rejet
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL DE CONFIRMATION DE SUPPRESSION DÉFINITIVE D'UN UTILISATEUR */}
+      {userToDelete && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 animate-in zoom-in-95 duration-200">
+            <div className="flex items-center gap-3 text-red-600 mb-4">
+              <div className="p-3 bg-red-50 rounded-xl border border-red-100">
+                <Trash2 size={24} />
+              </div>
+              <div>
+                <h3 className="text-base font-black text-slate-900">Supprimer cet utilisateur ?</h3>
+                <p className="text-xs text-slate-500 font-medium">Action irréversible sur Supabase</p>
+              </div>
+            </div>
+
+            <div className="bg-slate-50 rounded-xl p-3.5 border border-slate-200/80 mb-4 space-y-1.5">
+              <p className="text-xs text-slate-700 font-bold">
+                Nom : <span className="font-normal text-slate-900">{userToDelete.name}</span>
+              </p>
+              <p className="text-xs text-slate-700 font-bold">
+                Email : <span className="font-normal text-slate-900">{userToDelete.email}</span>
+              </p>
+              <p className="text-xs text-slate-700 font-bold">
+                Rôle : <span className="font-normal text-slate-900">{userToDelete.role}</span>
+              </p>
+              {userToDelete.telephone && (
+                <p className="text-xs text-slate-700 font-bold">
+                  Téléphone : <span className="font-normal text-slate-900">{userToDelete.telephone}</span>
+                </p>
+              )}
+            </div>
+
+            <p className="text-xs text-slate-500 mb-5 leading-relaxed">
+              Êtes-vous sûr de vouloir supprimer définitivement le profil de cet utilisateur ? Son compte sera effacé de la table <code className="bg-slate-100 text-slate-800 px-1 py-0.5 rounded text-[11px] font-mono">profiles</code> dans Supabase.
+            </p>
+
+            <div className="flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => setUserToDelete(null)}
+                className="px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-xl transition-colors cursor-pointer"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                disabled={userDeleteLoading}
+                onClick={handleConfirmDeleteUser}
+                className="px-4 py-2 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded-xl transition-all shadow-sm flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {userDeleteLoading ? (
+                  <>
+                    <RefreshCw size={13} className="animate-spin" /> Suppression...
+                  </>
+                ) : (
+                  <>
+                    <Trash2 size={14} /> Supprimer définitivement
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 // Declarer les utilisateurs en local pour l'affichage de l'Admin
-const localUsersTemplateForDisplay = [
+const localUsersTemplateForDisplay: User[] = [
   { id: "u-admin", name: "Justin Ciza (Admin)", email: "admin@stoppaludisme.cd", role: "admin" as const },
   { id: "u-vendeur", name: "Bahati Murhula (Vendeur)", email: "vendeur@stoppaludisme.cd", role: "vendeur" as const },
   { id: "u-distrib", name: "Kavira Masika (Distributeur)", email: "distributeur@stoppaludisme.cd", role: "distributeur" as const },

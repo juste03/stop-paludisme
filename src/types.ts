@@ -8,8 +8,10 @@ export interface User {
   commission_rate?: number; // Pourcentage de commission personnalisé (ex: 15, 20)
   telephone?: string;
   statut?: "en_attente" | "valide" | "rejete";
+  status?: "en_attente" | "valide" | "rejete";
   created_at?: string;
   avatar_url?: string;
+  quartier?: string;
 }
 
 export interface Produit {
@@ -131,7 +133,7 @@ export interface FactureAgent {
   date_creation: string;
   ventes_count: number;
   total_commission_usd: number;
-  total_commission_cdf: number;
+  total_commission_cdf?: number; // Déprécié: Commissions calculées et versées uniquement en USD
   statut: "en_attente" | "paye"; // Caissier valide
   date_paiement?: string;
   salaire_fixe?: number;
@@ -162,8 +164,9 @@ export interface AppNotification {
   destinataire_id?: string;
   auteur_nom: string;
   lu?: boolean;
+  is_read?: boolean;
   created_at: string;
-  type?: "info" | "alerte" | "stock" | "reassort" | "validation";
+  type?: "stock_bas" | "nouvelle_vente" | "reassort" | "validation" | "protocole" | "info" | "alerte" | "stock" | string;
 }
 
 export interface StatsQuartier {

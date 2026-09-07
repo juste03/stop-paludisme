@@ -24,7 +24,7 @@ export const SUPABASE_URL =
 
 export const SUPABASE_ANON_KEY =
   (import.meta as any).env?.VITE_SUPABASE_ANON_KEY ||
-  "sb_publishable_LLHVEDNmE1jPQ9cRMGWMoQ_X7FxDg1o";
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJnYmRoYW54c3dnbGdmbGJrYXpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY2NDIxMTEsImV4cCI6MjEwMjIxODExMX0.TQyiGaz2dQM0uMWeDeQw1_om2iu9U0qUiYAQ1DHqla0";
 
 export const isSupabaseConfigured = Boolean(
   SUPABASE_URL &&
@@ -51,6 +51,7 @@ const STORAGE_KEYS = {
   PRODUITS: "sp_produits_v2",
   CLIENTS: "sp_clients_v2",
   VENTES: "sp_ventes_v2",
+  OFFLINE_VENTES_QUEUE: "sp_offline_ventes_queue_v2",
   PROTOCOLES: "sp_protocoles_v2",
   AGENT_STOCKS: "sp_agent_stocks_v2",
   REASSORTS: "sp_reassorts_v2",
@@ -190,7 +191,7 @@ const SEED_VENTES: Vente[] = [
     type_paiement: "cash",
     commission_taux: 15,
     commission_montant: 1.5,
-    commission_montant_cdf: 4275,
+    commission_montant_cdf: 0,
     taux_change: 2850,
     statut_paiement: "valide"
   },
@@ -211,7 +212,7 @@ const SEED_VENTES: Vente[] = [
     type_paiement: "mpesa",
     commission_taux: 20,
     commission_montant: 10.11,
-    commission_montant_cdf: 28800,
+    commission_montant_cdf: 0,
     taux_change: 2850,
     statut_paiement: "valide"
   }
@@ -308,6 +309,17 @@ export const db = {
               statut: profile.statut || "valide",
               telephone: profile.telephone || ""
             };
+
+            // Blocage impératif : Aucun accès sans validation préalable de l'administrateur
+            if (loggedUser.statut === "en_attente") {
+              if (supabase) await supabase.auth.signOut().catch(() => {});
+              throw new Error("Votre compte est actuellement en attente de validation par l'administrateur. Veuillez patienter avant de pouvoir vous connecter.");
+            }
+            if (loggedUser.statut === "rejete") {
+              if (supabase) await supabase.auth.signOut().catch(() => {});
+              throw new Error("Votre demande d'accès a été rejetée par l'administration.");
+            }
+
             // Cache local
             const users = getStored<User[]>(STORAGE_KEYS.USERS, SEED_USERS);
             const existsIdx = users.findIndex(u => u.id === loggedUser.id);
@@ -317,7 +329,10 @@ export const db = {
             return loggedUser;
           }
         }
-      } catch (e) {
+      } catch (e: any) {
+        if (e.message && (e.message.includes("en attente de validation") || e.message.includes("rejetée"))) {
+          throw e;
+        }
         console.warn("Connexion Supabase non disponible, fallback local:", e);
       }
     }
@@ -329,6 +344,9 @@ export const db = {
     );
 
     if (found) {
+      if (found.statut === "en_attente") {
+        throw new Error("Votre compte est actuellement en attente de validation par l'administrateur. Veuillez patienter avant de pouvoir vous connecter.");
+      }
       if (found.statut === "rejete") {
         throw new Error("Votre demande d'accès a été rejetée par l'administration.");
       }
@@ -463,8 +481,10 @@ export const db = {
             role: (d.role as UserRole) || "vendeur",
             commission_rate: d.commission_rate ?? (d.role === "distributeur" ? 20 : 15),
             telephone: d.telephone || "",
-            statut: d.statut || "valide",
-            created_at: d.created_at
+            statut: d.status || d.statut || "valide",
+            status: d.status || d.statut || "valide",
+            created_at: d.created_at,
+            quartier: d.quartier || ""
           }));
           setStored(STORAGE_KEYS.USERS, mapped);
           return mapped;
@@ -478,49 +498,108 @@ export const db = {
 
   async validateUser(userId: string, role: UserRole, commissionRate: number): Promise<User> {
     const users = getStored<User[]>(STORAGE_KEYS.USERS, SEED_USERS);
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx === -1) throw new Error("Utilisateur introuvable");
+    let idx = users.findIndex(u => u.id === userId);
 
-    users[idx].statut = "valide";
-    users[idx].role = role;
-    users[idx].commission_rate = commissionRate;
+    if (idx === -1) {
+      const newUserObj: User = {
+        id: userId,
+        name: "Agent " + userId.substring(0, 5),
+        email: `${userId}@stoppaludisme.cd`,
+        role,
+        statut: "valide",
+        status: "valide",
+        commission_rate: commissionRate,
+        telephone: ""
+      };
+      users.push(newUserObj);
+      idx = users.length - 1;
+    } else {
+      users[idx].statut = "valide";
+      users[idx].status = "valide";
+      users[idx].role = role;
+      users[idx].commission_rate = commissionRate;
+    }
     setStored(STORAGE_KEYS.USERS, users);
 
     if (supabase) {
       try {
-        await supabase.from("profiles").update({
+        // Met à jour à la fois status et statut pour couvrir tous les schémas Supabase
+        const { error } = await supabase.from("profiles").update({
+          status: "valide",
           statut: "valide",
           role,
           commission_rate: commissionRate
         }).eq("id", userId);
+        if (error) {
+          // Fallback colonne unitaire
+          const r1 = await supabase.from("profiles").update({
+            status: "valide",
+            role,
+            commission_rate: commissionRate
+          }).eq("id", userId);
+          if (r1.error) {
+            await supabase.from("profiles").update({
+              statut: "valide",
+              role,
+              commission_rate: commissionRate
+            }).eq("id", userId);
+          }
+        }
       } catch (e) {
         console.warn("Supabase validateUser error:", e);
       }
     }
 
     // Alerter l'agent via le système de notification
-    await this.sendNotification({
-      titre: "Compte validé !",
-      message: `Votre compte a été approuvé avec le rôle "${role}" et un taux de commission de ${commissionRate}%.`,
-      destinataire_id: userId,
-      auteur_nom: "Administration",
-      type: "validation"
-    });
+    try {
+      await this.sendNotification({
+        titre: "Compte validé !",
+        message: `Votre compte a été approuvé avec le rôle "${role}" et un taux de commission de ${commissionRate}%.`,
+        destinataire_id: userId,
+        auteur_nom: "Administration",
+        type: "validation"
+      });
+    } catch {}
 
     return users[idx];
   },
 
   async rejectUser(userId: string): Promise<User> {
     const users = getStored<User[]>(STORAGE_KEYS.USERS, SEED_USERS);
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx === -1) throw new Error("Utilisateur introuvable");
+    let idx = users.findIndex(u => u.id === userId);
 
-    users[idx].statut = "rejete";
+    if (idx === -1) {
+      const newUserObj: User = {
+        id: userId,
+        name: "Agent " + userId.substring(0, 5),
+        email: `${userId}@stoppaludisme.cd`,
+        role: "vendeur",
+        statut: "rejete",
+        status: "rejete",
+        commission_rate: 15,
+        telephone: ""
+      };
+      users.push(newUserObj);
+      idx = users.length - 1;
+    } else {
+      users[idx].statut = "rejete";
+      users[idx].status = "rejete";
+    }
     setStored(STORAGE_KEYS.USERS, users);
 
     if (supabase) {
       try {
-        await supabase.from("profiles").update({ statut: "rejete" }).eq("id", userId);
+        // Met à jour à la fois status et statut
+        const { error } = await supabase.from("profiles").update({
+          status: "rejete",
+          statut: "rejete"
+        }).eq("id", userId);
+        if (error) {
+          const r1 = await supabase.from("profiles").update({ status: "rejete" }).eq("id", userId);
+          if (r1.error) {
+            await supabase.from("profiles").update({ statut: "rejete" }).eq("id", userId);
+          }
+        }
       } catch (e) {
         console.warn("Supabase rejectUser error:", e);
       }
@@ -531,11 +610,12 @@ export const db = {
 
   async updateCommissionRate(userId: string, rate: number): Promise<User> {
     const users = getStored<User[]>(STORAGE_KEYS.USERS, SEED_USERS);
-    const idx = users.findIndex(u => u.id === userId);
-    if (idx === -1) throw new Error("Utilisateur introuvable");
+    let idx = users.findIndex(u => u.id === userId);
 
-    users[idx].commission_rate = rate;
-    setStored(STORAGE_KEYS.USERS, users);
+    if (idx !== -1) {
+      users[idx].commission_rate = rate;
+      setStored(STORAGE_KEYS.USERS, users);
+    }
 
     if (supabase) {
       try {
@@ -545,36 +625,52 @@ export const db = {
       }
     }
 
-    return users[idx];
+    return idx !== -1 ? users[idx] : { id: userId, name: "Agent", email: "", role: "vendeur", statut: "valide", commission_rate: rate };
   },
 
   async deleteUser(userId: string): Promise<void> {
     const users = getStored<User[]>(STORAGE_KEYS.USERS, SEED_USERS);
+    const targetUser = users.find(u => u.id === userId);
     const filtered = users.filter(u => u.id !== userId);
     setStored(STORAGE_KEYS.USERS, filtered);
 
     if (supabase) {
       try {
-        await supabase.from("profiles").delete().eq("id", userId);
+        const { error } = await supabase.from("profiles").delete().eq("id", userId);
+        if (error) {
+          console.warn("Supabase deleteUser par id échoué, tentative par email:", error);
+          if (targetUser?.email) {
+            await supabase.from("profiles").delete().eq("email", targetUser.email);
+          }
+        }
       } catch (e) {
-        console.warn("Supabase deleteUser error:", e);
+        console.warn("Supabase deleteUser exception:", e);
       }
     }
   },
 
   // --------------------------------------------------------------------------
-  // PRODUITS DU CATALOGUE
+  // PRODUITS DU CATALOGUE (Table Supabase: products)
   // --------------------------------------------------------------------------
   async getProduits(): Promise<Produit[]> {
     if (supabase) {
       try {
-        const { data, error } = await supabase.from("produits").select("*");
+        const { data, error } = await supabase.from("products").select("*");
         if (!error && data && data.length > 0) {
-          setStored(STORAGE_KEYS.PRODUITS, data);
-          return data;
+          const mapped: Produit[] = data.map((d: any) => ({
+            id: d.id,
+            nom: d.nom || d.name || "Produit",
+            type: (d.type === "consommable" ? "consommable" : "moustiquaire") as "moustiquaire" | "consommable",
+            description: d.description || "",
+            prix: Number(d.prix ?? d.price ?? d.prix_usd ?? 0),
+            devise: (d.devise || "USD") as "USD" | "CDF",
+            stock: Number(d.stock ?? 0)
+          }));
+          setStored(STORAGE_KEYS.PRODUITS, mapped);
+          return mapped;
         }
       } catch (e) {
-        console.warn("Supabase getProduits fallback:", e);
+        console.warn("Supabase getProducts fallback:", e);
       }
     }
     return getStored<Produit[]>(STORAGE_KEYS.PRODUITS, SEED_PRODUITS);
@@ -591,9 +687,9 @@ export const db = {
 
     if (supabase) {
       try {
-        await supabase.from("produits").insert(newP);
+        await supabase.from("products").insert(newP);
       } catch (e) {
-        console.warn("Supabase insert produit error:", e);
+        console.warn("Supabase insert product error:", e);
       }
     }
 
@@ -610,9 +706,9 @@ export const db = {
 
     if (supabase) {
       try {
-        await supabase.from("produits").update(p).eq("id", id);
+        await supabase.from("products").update(p).eq("id", id);
       } catch (e) {
-        console.warn("Supabase update produit error:", e);
+        console.warn("Supabase update product error:", e);
       }
     }
 
@@ -626,9 +722,9 @@ export const db = {
 
     if (supabase) {
       try {
-        await supabase.from("produits").delete().eq("id", id);
+        await supabase.from("products").delete().eq("id", id);
       } catch (e) {
-        console.warn("Supabase delete produit error:", e);
+        console.warn("Supabase delete product error:", e);
       }
     }
   },
@@ -637,17 +733,6 @@ export const db = {
   // CLIENTS
   // --------------------------------------------------------------------------
   async getClients(): Promise<Client[]> {
-    if (supabase) {
-      try {
-        const { data, error } = await supabase.from("clients").select("*");
-        if (!error && data && data.length > 0) {
-          setStored(STORAGE_KEYS.CLIENTS, data);
-          return data;
-        }
-      } catch (e) {
-        console.warn("Supabase getClients fallback:", e);
-      }
-    }
     return getStored<Client[]>(STORAGE_KEYS.CLIENTS, SEED_CLIENTS);
   },
 
@@ -659,15 +744,6 @@ export const db = {
     const clients = getStored<Client[]>(STORAGE_KEYS.CLIENTS, SEED_CLIENTS);
     clients.push(newC);
     setStored(STORAGE_KEYS.CLIENTS, clients);
-
-    if (supabase) {
-      try {
-        await supabase.from("clients").insert(newC);
-      } catch (e) {
-        console.warn("Supabase insert client error:", e);
-      }
-    }
-
     return newC;
   },
 
@@ -675,19 +751,6 @@ export const db = {
   // STOCKS AGENTS & DÉPÔTS FIXES
   // --------------------------------------------------------------------------
   async getAgentStocks(agentId?: string): Promise<AgentStock[]> {
-    if (supabase) {
-      try {
-        let query = supabase.from("agent_stocks").select("*");
-        if (agentId) query = query.eq("agent_id", agentId);
-        const { data, error } = await query;
-        if (!error && data && data.length > 0) {
-          if (!agentId) setStored(STORAGE_KEYS.AGENT_STOCKS, data);
-          return data;
-        }
-      } catch (e) {
-        console.warn("Supabase getAgentStocks fallback:", e);
-      }
-    }
     const all = getStored<AgentStock[]>(STORAGE_KEYS.AGENT_STOCKS, SEED_AGENT_STOCKS);
     if (agentId) return all.filter(s => s.agent_id === agentId);
     return all;
@@ -737,9 +800,7 @@ export const db = {
 
     if (supabase) {
       try {
-        await supabase.from("produits").update({ stock: prod.stock }).eq("id", produitId);
-        const sTarget = agentStocks.find(s => s.agent_id === agentId && s.produit_id === produitId);
-        if (sTarget) await supabase.from("agent_stocks").upsert(sTarget);
+        await supabase.from("products").update({ stock: prod.stock }).eq("id", produitId);
       } catch (e) {
         console.warn("Supabase transferStock error:", e);
       }
@@ -864,22 +925,35 @@ export const db = {
   // VENTES & COMMISSIONS MÉTIER (15% Vendeur, 20% Distributeur)
   // --------------------------------------------------------------------------
   async getVentes(agentId?: string): Promise<Vente[]> {
+    let cloudVentes: Vente[] = [];
     if (supabase) {
       try {
         let query = supabase.from("ventes").select("*");
         if (agentId) query = query.eq("agent_id", agentId);
         const { data, error } = await query;
         if (!error && data && data.length > 0) {
+          cloudVentes = data;
           if (!agentId) setStored(STORAGE_KEYS.VENTES, data);
-          return data;
         }
       } catch (e) {
         console.warn("Supabase getVentes fallback:", e);
       }
     }
-    const all = getStored<Vente[]>(STORAGE_KEYS.VENTES, SEED_VENTES);
-    if (agentId) return all.filter(v => v.agent_id === agentId);
-    return all;
+
+    const localVentes = getStored<Vente[]>(STORAGE_KEYS.VENTES, SEED_VENTES);
+    const offlineQueue = getStored<Vente[]>(STORAGE_KEYS.OFFLINE_VENTES_QUEUE, []);
+
+    // Fusionner pour s'assurer que les ventes hors-ligne créées localement ne disparaissent jamais
+    const baseList = cloudVentes.length > 0 ? cloudVentes : localVentes;
+    const combined = [...baseList];
+    for (const off of offlineQueue) {
+      if (!combined.some(v => v.id === off.id)) {
+        combined.unshift(off);
+      }
+    }
+
+    if (agentId) return combined.filter(v => v.agent_id === agentId);
+    return combined;
   },
 
   async createVente(body: {
@@ -941,7 +1015,7 @@ export const db = {
       });
     }
 
-    // 3. Calcul de la commission métier (15% vendeur, 20% distributeur)
+    // 3. Calcul de la commission métier strictement en Dollars (USD) (15% vendeur, 20% distributeur)
     const agentObj = users.find(u => u.id === body.agent_id);
     const commissionTaux = agentObj?.commission_rate !== undefined
       ? agentObj.commission_rate
@@ -950,7 +1024,6 @@ export const db = {
           : (agentObj?.role === "distributeur" ? 20 : 15));
 
     const commissionUSD = total_usd * (commissionTaux / 100);
-    const commissionCDF = total_cdf * (commissionTaux / 100);
 
     // 4. Enregistrement automatique du client si nouveau
     let finalClientId = body.client_id;
@@ -978,24 +1051,74 @@ export const db = {
       type_paiement: body.type_paiement || "cash",
       commission_taux: commissionTaux,
       commission_montant: parseFloat(commissionUSD.toFixed(2)),
-      commission_montant_cdf: Math.round(commissionCDF),
+      commission_montant_cdf: 0,
       taux_change: exchangeRate,
-      statut_paiement: "en_attente" // Doit être validé par la caisse
+      statut_paiement: "valide" // Vente directe validée automatiquement avec crédit immédiat de commission
     };
 
+    // Sauvegarde immédiate dans le cache local
     const ventes = getStored<Vente[]>(STORAGE_KEYS.VENTES, SEED_VENTES);
     ventes.unshift(newVente);
     setStored(STORAGE_KEYS.VENTES, ventes);
 
-    if (supabase) {
+    let isCloudSynced = false;
+    if (supabase && typeof navigator !== "undefined" && navigator.onLine) {
       try {
-        await supabase.from("ventes").insert(newVente);
+        const { error } = await supabase.from("ventes").insert(newVente);
+        if (!error) {
+          isCloudSynced = true;
+        } else {
+          console.warn("Supabase insert vente warning:", error);
+        }
       } catch (e) {
         console.warn("Supabase insert vente error:", e);
       }
     }
 
+    // Si pas envoyé au Cloud (mode hors-ligne ou erreur réseau), empiler dans la file d'attente offline
+    if (!isCloudSynced) {
+      const queue = getStored<Vente[]>(STORAGE_KEYS.OFFLINE_VENTES_QUEUE, []);
+      if (!queue.some(v => v.id === newVente.id)) {
+        queue.push(newVente);
+        setStored(STORAGE_KEYS.OFFLINE_VENTES_QUEUE, queue);
+      }
+    }
+
     return newVente;
+  },
+
+  getOfflineVentesQueue(): Vente[] {
+    return getStored<Vente[]>(STORAGE_KEYS.OFFLINE_VENTES_QUEUE, []);
+  },
+
+  async syncOfflineData(): Promise<{ syncedCount: number; errorsCount: number }> {
+    const queue = getStored<Vente[]>(STORAGE_KEYS.OFFLINE_VENTES_QUEUE, []);
+    if (queue.length === 0) return { syncedCount: 0, errorsCount: 0 };
+    if (!supabase || (typeof navigator !== "undefined" && !navigator.onLine)) {
+      return { syncedCount: 0, errorsCount: queue.length };
+    }
+
+    let syncedCount = 0;
+    let errorsCount = 0;
+    const remaining: Vente[] = [];
+
+    for (const vente of queue) {
+      try {
+        const { error } = await supabase.from("ventes").upsert(vente);
+        if (!error) {
+          syncedCount++;
+        } else {
+          errorsCount++;
+          remaining.push(vente);
+        }
+      } catch (e) {
+        errorsCount++;
+        remaining.push(vente);
+      }
+    }
+
+    setStored(STORAGE_KEYS.OFFLINE_VENTES_QUEUE, remaining);
+    return { syncedCount, errorsCount };
   },
 
   async updateVenteStatut(id: string, statut: "valide"): Promise<Vente> {
@@ -1168,7 +1291,6 @@ export const db = {
         }
 
         const commUSD = b.total_usd * (commissionTaux / 100);
-        const commCDF = b.total_cdf * (commissionTaux / 100);
 
         const newVente: Vente = {
           id: "v-pr-" + Math.random().toString(36).substring(2, 7),
@@ -1184,7 +1306,7 @@ export const db = {
           type_paiement: "credit",
           commission_taux: commissionTaux,
           commission_montant: parseFloat(commUSD.toFixed(2)),
-          commission_montant_cdf: Math.round(commCDF),
+          commission_montant_cdf: 0,
           taux_change: prot.taux_change,
           statut_paiement: "valide" // Validée d'office pour créditer la commission
         };
@@ -1341,7 +1463,6 @@ export const db = {
       const agentObj = users.find(u => u.id === prot.agent_id);
       const commTaux = agentObj?.commission_rate ?? (agentObj?.role === "distributeur" ? 20 : 15);
       const commUSD = b_usd * (commTaux / 100);
-      const commCDF = b_cdf * (commTaux / 100);
 
       const newVente: Vente = {
         id: "v-pr-add-" + Math.random().toString(36).substring(2, 7),
@@ -1357,7 +1478,7 @@ export const db = {
         type_paiement: "credit",
         commission_taux: commTaux,
         commission_montant: parseFloat(commUSD.toFixed(2)),
-        commission_montant_cdf: Math.round(commCDF),
+        commission_montant_cdf: 0,
         taux_change: prot.taux_change,
         statut_paiement: "valide"
       };
@@ -1388,19 +1509,6 @@ export const db = {
   // SALAIRES FIXES ($40 VENDEUR, $0 DISTRIB) & FICHES DE PAIE
   // --------------------------------------------------------------------------
   async getFactures(agentId?: string): Promise<FactureAgent[]> {
-    if (supabase) {
-      try {
-        let query = supabase.from("paiements_factures").select("*");
-        if (agentId) query = query.eq("agent_id", agentId);
-        const { data, error } = await query;
-        if (!error && data && data.length > 0) {
-          if (!agentId) setStored(STORAGE_KEYS.FACTURES, data);
-          return data;
-        }
-      } catch (e) {
-        console.warn("Supabase getFactures fallback:", e);
-      }
-    }
     const all = getStored<FactureAgent[]>(STORAGE_KEYS.FACTURES, []);
     if (agentId) return all.filter(f => f.agent_id === agentId);
     return all;
@@ -1438,15 +1546,6 @@ export const db = {
     const factures = getStored<FactureAgent[]>(STORAGE_KEYS.FACTURES, []);
     factures.unshift(newF);
     setStored(STORAGE_KEYS.FACTURES, factures);
-
-    if (supabase) {
-      try {
-        await supabase.from("paiements_factures").insert(newF);
-      } catch (e) {
-        console.warn("Supabase insert facture error:", e);
-      }
-    }
-
     return newF;
   },
 
@@ -1458,27 +1557,28 @@ export const db = {
     factures[idx].statut = "paye";
     factures[idx].date_paiement = new Date().toISOString().split("T")[0];
     setStored(STORAGE_KEYS.FACTURES, factures);
-
-    if (supabase) {
-      try {
-        await supabase.from("paiements_factures").update({
-          statut: "paye",
-          date_paiement: factures[idx].date_paiement
-        }).eq("id", id);
-      } catch (e) {
-        console.warn("Supabase validerFacture error:", e);
-      }
-    }
-
     return factures[idx];
   },
 
   // --------------------------------------------------------------------------
-  // ARRIVAGES DE STOCK & AUDIT LOGS
+  // ARRIVAGES DE STOCK & AUDIT LOGS (Table Supabase: stock_arrivals)
   // --------------------------------------------------------------------------
   async getStockArrivalsAndLogs(): Promise<{ arrivals: StockArrival[]; auditLogs: AuditLog[] }> {
-    const arrivals = getStored<StockArrival[]>(STORAGE_KEYS.STOCK_ARRIVALS, []);
+    let arrivals = getStored<StockArrival[]>(STORAGE_KEYS.STOCK_ARRIVALS, []);
     const auditLogs = getStored<AuditLog[]>(STORAGE_KEYS.AUDIT_LOGS, []);
+
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from("stock_arrivals").select("*").order("date_enregistrement", { ascending: false });
+        if (!error && data && data.length > 0) {
+          arrivals = data;
+          setStored(STORAGE_KEYS.STOCK_ARRIVALS, arrivals);
+        }
+      } catch (e) {
+        console.warn("Supabase getStockArrivals fallback:", e);
+      }
+    }
+
     return { arrivals, auditLogs };
   },
 
@@ -1516,7 +1616,7 @@ export const db = {
     if (supabase) {
       try {
         await supabase.from("stock_arrivals").insert(newArr);
-        await supabase.from("produits").update({ stock: prod.stock }).eq("id", produitId);
+        await supabase.from("products").update({ stock: prod.stock }).eq("id", produitId);
       } catch (e) {
         console.warn("Supabase createStockArrival error:", e);
       }
@@ -1550,6 +1650,15 @@ export const db = {
       auteur: auteurNom
     });
 
+    if (supabase) {
+      try {
+        await supabase.from("stock_arrivals").update({ quantite: newQty }).eq("id", id);
+        await supabase.from("products").update({ stock: prod.stock }).eq("id", arrival.produit_id);
+      } catch (e) {
+        console.warn("Supabase updateStockArrival error:", e);
+      }
+    }
+
     return arrival;
   },
 
@@ -1575,6 +1684,17 @@ export const db = {
       date: new Date().toISOString().replace("T", " ").substring(0, 16),
       auteur: auteurNom
     });
+
+    if (supabase) {
+      try {
+        await supabase.from("stock_arrivals").delete().eq("id", id);
+        if (prod) {
+          await supabase.from("products").update({ stock: prod.stock }).eq("id", arrival.produit_id);
+        }
+      } catch (e) {
+        console.warn("Supabase deleteStockArrival error:", e);
+      }
+    }
   },
 
   async addAuditLog(log: Omit<AuditLog, "id">): Promise<AuditLog> {
@@ -1585,15 +1705,6 @@ export const db = {
     const logs = getStored<AuditLog[]>(STORAGE_KEYS.AUDIT_LOGS, []);
     logs.unshift(newLog);
     setStored(STORAGE_KEYS.AUDIT_LOGS, logs);
-
-    if (supabase) {
-      try {
-        await supabase.from("audit_logs").insert(newLog);
-      } catch (e) {
-        console.warn("Supabase insert audit log error:", e);
-      }
-    }
-
     return newLog;
   },
 
@@ -1609,8 +1720,20 @@ export const db = {
           .order("created_at", { ascending: false });
 
         if (!error && data && data.length > 0) {
-          setStored(STORAGE_KEYS.NOTIFICATIONS, data);
-          return data.filter(n => {
+          const mapped: AppNotification[] = data.map((d: any) => ({
+            id: d.id,
+            titre: d.titre || d.title || "Notification",
+            message: d.message || d.desc || "",
+            destinataire_role: d.destinataire_role || d.target_role || "all",
+            destinataire_id: d.destinataire_id || d.target_user_id || undefined,
+            auteur_nom: d.auteur_nom || d.author || "Système",
+            lu: Boolean(d.lu ?? d.is_read ?? false),
+            is_read: Boolean(d.is_read ?? d.lu ?? false),
+            created_at: d.created_at || new Date().toISOString(),
+            type: d.type || "info"
+          }));
+          setStored(STORAGE_KEYS.NOTIFICATIONS, mapped);
+          return mapped.filter(n => {
             if (!role && !userId) return true;
             if (n.destinataire_role === "all") return true;
             if (role && n.destinataire_role === role) return true;
@@ -1639,7 +1762,7 @@ export const db = {
     destinataire_role?: string;
     destinataire_id?: string;
     auteur_nom: string;
-    type?: "info" | "alerte" | "stock" | "reassort" | "validation";
+    type?: "stock_bas" | "nouvelle_vente" | "reassort" | "validation" | "protocole" | "info" | "alerte" | "stock" | string;
   }): Promise<AppNotification> {
     const newN: AppNotification = {
       id: "notif-" + Math.random().toString(36).substring(2, 9),
@@ -1649,6 +1772,7 @@ export const db = {
       destinataire_id: params.destinataire_id,
       auteur_nom: params.auteur_nom,
       lu: false,
+      is_read: false,
       created_at: new Date().toISOString(),
       type: params.type || "info"
     };
@@ -1659,7 +1783,18 @@ export const db = {
 
     if (supabase) {
       try {
-        await supabase.from("notifications").insert(newN);
+        await supabase.from("notifications").insert({
+          id: newN.id,
+          titre: newN.titre,
+          message: newN.message,
+          destinataire_role: newN.destinataire_role,
+          destinataire_id: newN.destinataire_id,
+          auteur_nom: newN.auteur_nom,
+          lu: false,
+          is_read: false,
+          created_at: newN.created_at,
+          type: newN.type
+        });
       } catch (e) {
         console.warn("Supabase insert notification error:", e);
       }
@@ -1673,12 +1808,19 @@ export const db = {
     const target = notifs.find(n => n.id === id);
     if (target) {
       target.lu = true;
+      target.is_read = true;
       setStored(STORAGE_KEYS.NOTIFICATIONS, notifs);
     }
 
     if (supabase) {
       try {
-        await supabase.from("notifications").update({ lu: true }).eq("id", id);
+        const { error } = await supabase.from("notifications").update({ is_read: true, lu: true }).eq("id", id);
+        if (error) {
+          const r1 = await supabase.from("notifications").update({ is_read: true }).eq("id", id);
+          if (r1.error) {
+            await supabase.from("notifications").update({ lu: true }).eq("id", id);
+          }
+        }
       } catch (e) {
         console.warn("Supabase markNotificationAsRead error:", e);
       }
